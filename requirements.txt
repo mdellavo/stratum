@@ -1,0 +1,2 @@
+https://download.electrum.org/2.7.12/Electrum-2.7.12.tar.gz
+pyramid
