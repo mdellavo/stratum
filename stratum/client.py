@@ -159,9 +159,11 @@ class ConnectionHandler(object):
 
 
 class ConnectionPool(object):
-    def __init__(self):
+    def __init__(self, max_size):
         self.connections = Queue.Queue()
         self.peers = Peer.discover()
+        self.max_size = max_size
+        self.count = 0
 
     def get(self):
         return ConnectionHandler(self)
@@ -176,12 +178,18 @@ class ConnectionPool(object):
 
     def take(self):
         try:
-            connection = self.connections.get_nowait()
+            if self.count == self.max_size:
+                connection = self.connections.get(block=True)
+            else:
+                connection = self.connections.get_nowait()
         except Queue.Empty:
             connection = self.connect()
         return connection
 
     def connect(self):
+        if self.count >= self.max_size:
+            return None
+
         for _ in range(100):
             peer = random.choice(self.peers)
             addresses = peer.clearnet_addresses
@@ -199,13 +207,15 @@ class ConnectionPool(object):
             address = addresses[0]
             port = ports[0]
             try:
-                return Connection(host=address, port=port, ssl=has_ssl)
+                conn = Connection(host=address, port=port, ssl=has_ssl)
+                self.count += 1
+                return conn
             except socket.error as e:
                 log.error("could not connect to %s: %s", address, e)
 
 if __name__ == "__main__":
 
-    pool = ConnectionPool()
+    pool = ConnectionPool(1)
 
     for _ in range(3):
         with pool.get() as conn:
