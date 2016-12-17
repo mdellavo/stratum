@@ -5,6 +5,7 @@ import socket
 import logging
 import random
 import Queue
+import threading
 
 RECV_SIZE = 2 ** 16
 CLIENT_VERSION = "0.0"
@@ -19,6 +20,44 @@ logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger("stratum-client")
 
 
+def encode_msg(msg):
+    return json.dumps(msg).encode() + b"\n"
+
+
+def socket_reader(sock, queue):
+    f = sock.makefile()
+
+    while True:
+        try:
+            line = f.readline()
+        except socket.timeout:
+            continue
+        except (socket.error, ssl.SSLError) as e:
+            log.error("error reading from socket: %s", e)
+            break
+        if not line:
+            break
+        # log.debug(">>> %s", line.strip())
+        msg = json.loads(line.strip())
+        queue.put(msg)
+    sock.close()
+
+
+def socket_writer(sock, queue):
+    while True:
+        msg = queue.get()
+        if not msg:
+            break
+        try:
+            payload = encode_msg(msg)
+            # log.debug("<<< %s", payload.strip())
+            sock.send(payload)
+        except (socket.error, ssl.SSLError) as e:
+            log.error("error writing from socket: %s", e)
+            break
+    sock.close()
+
+
 class Connection(object):
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, ssl=False):
         self.host = host
@@ -27,8 +66,12 @@ class Connection(object):
         self.call_count = 0
 
         self.socket = None
-        self.file = None
         self.server_version = None
+
+        self.reader = None
+        self.writer = None
+        self.incoming = Queue.Queue()
+        self.outgoing = Queue.Queue()
 
         self.connect()
 
@@ -45,8 +88,16 @@ class Connection(object):
     def connect(self):
         log.debug("connecting to %s:%s...", self.host, self.port)
         self.socket = self.create_socket()
-        self.file = self.socket.makefile()
         log.info("connected to %s:%s", self.host, self.port)
+
+        self.reader = threading.Thread(target=socket_reader, args=(self.socket, self.incoming))
+        self.reader.setDaemon(True)
+        self.reader.start()
+
+        self.writer = threading.Thread(target=socket_writer, args=(self.socket, self.outgoing))
+        self.writer.setDaemon(True)
+        self.writer.start()
+
         self.version()
 
     def version(self):
@@ -55,30 +106,31 @@ class Connection(object):
     def close(self):
         self.socket.close()
         log.info("disconnected from %s:%s", self.host, self.port)
-        self.socket = self.file = None
-
-    def encode(self, payload):
-        return json.dumps(payload).encode() + b"\n"
+        self.socket = None
 
     def send(self, method, params):
-        payload = {"id": self.call_count, "method": method, "params": params}
-        #log.debug("<<< %s", payload)
+        msg = {"id": self.call_count, "method": method, "params": params}
         self.call_count += 1
-        self.socket.send(self.encode(payload))
+        self.outgoing.put(msg)
+
+    def recv(self):
+        return self.incoming.get()
 
     def call(self, method, *params):
         t1 = time.time()
         self.send(method, params)
-        # FIXME this will not work if the response is multiline
-        line = self.file.readline().strip()
+        resp = self.recv()
         t2 = time.time()
         delta = (t2 - t1) * 1000
-        #log.debug(">>> %s", line)
         log.debug("%s(%s) took %sms", method, params, delta)
-        return json.loads(line)
+        return resp
 
 
 class Peer(object):
+
+    ADDRESS_TYPE_CLEAR = "c"
+    ADDRESS_TYPE_ONION = "o"
+    ADDRESS_TYPE_ANY = "a"
 
     PORT_TYPE_TCP = "t"
     PORT_TYPE_SSL = "s"
@@ -125,6 +177,10 @@ class Peer(object):
         return [Peer(peer[0:-1], peer[-1]) for peer in peers]
 
     @property
+    def all_addresses(self):
+        return [address for address in self.addresses]
+
+    @property
     def clearnet_addresses(self):
         return [address for address in self.addresses if not is_onion(address)]
 
@@ -158,6 +214,37 @@ class ConnectionHandler(object):
         self.connection_pool.release(self.connection)
 
 
+def connect_to_peer(peers, allow_tcp=True, address_type=Peer.ADDRESS_TYPE_CLEAR):
+    for _ in range(100):
+
+        peer = random.choice(peers)
+
+        if address_type == Peer.ADDRESS_TYPE_CLEAR:
+            addresses = peer.clearnet_addresses
+        elif address_type == Peer.ADDRESS_TYPE_ONION:
+            addresses = peer.onion_addresses
+        else:
+            addresses = peer.all_addresses
+
+        if not addresses:
+            continue
+
+        ports = peer.ssl_ports
+        has_ssl = bool(ports)
+        if not has_ssl and allow_tcp:
+            ports = peer.tcp_ports
+
+        if not ports:
+            continue
+
+        address = addresses[0]
+        port = ports[0]
+        try:
+            return Connection(host=address, port=port, ssl=has_ssl)
+        except socket.error as e:
+            log.error("could not connect to %s: %s", address, e)
+
+
 class ConnectionPool(object):
     def __init__(self, max_size):
         self.connections = Queue.Queue()
@@ -176,42 +263,20 @@ class ConnectionPool(object):
     def release(self, connection):
         self.connections.put(connection)
 
+    def new_connection(self):
+        conn = connect_to_peer(self.peers)
+        if conn:
+            self.count += 1
+        return conn
+
     def take(self):
+        block = self.count >= self.max_size
         try:
-            if self.count == self.max_size:
-                connection = self.connections.get(block=True)
-            else:
-                connection = self.connections.get_nowait()
+            connection = self.connections.get(block=block)
         except Queue.Empty:
-            connection = self.connect()
+            connection = self.new_connection()
         return connection
 
-    def connect(self):
-        if self.count >= self.max_size:
-            return None
-
-        for _ in range(100):
-            peer = random.choice(self.peers)
-            addresses = peer.clearnet_addresses
-            if not addresses:
-                continue
-
-            ports = peer.ssl_ports
-            has_ssl = bool(ports)
-            if not has_ssl:
-                ports = peer.tcp_ports
-
-            if not ports:
-                continue
-
-            address = addresses[0]
-            port = ports[0]
-            try:
-                conn = Connection(host=address, port=port, ssl=has_ssl)
-                self.count += 1
-                return conn
-            except socket.error as e:
-                log.error("could not connect to %s: %s", address, e)
 
 if __name__ == "__main__":
 
@@ -219,7 +284,7 @@ if __name__ == "__main__":
 
     for _ in range(3):
         with pool.get() as conn:
-            rv = conn.call("server.banner")
+            rv = conn.call("server.version")
             print conn.host, conn.server_version
             print rv["result"]
         time.sleep(1)
