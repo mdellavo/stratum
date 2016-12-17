@@ -1,3 +1,4 @@
+import ssl
 import json
 import time
 import socket
@@ -12,19 +13,24 @@ PROTO_VERSION = "1.0"
 DEFAULT_HOST = "ecdsa.net"
 DEFAULT_PORT = 50001
 
+TIMEOUT = 5
+
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger("stratum-client")
 
 
 class Connection(object):
-    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT):
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, ssl=False):
+        self.host = host
+        self.port = port
+        self.ssl = ssl
+        self.call_count = 0
+
         self.socket = None
         self.file = None
-        self.host = None
-        self.port = None
         self.server_version = None
-        self.call_count = 0
-        self.connect(host, port)
+
+        self.connect()
 
     def __enter__(self):
         return self
@@ -32,18 +38,15 @@ class Connection(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def create_socket(self, host, port):
-        sock = socket.create_connection((host, port))
-        return sock
+    def create_socket(self):
+        sock = socket.create_connection((self.host, self.port), timeout=TIMEOUT)
+        return ssl.wrap_socket(sock) if self.ssl else sock
 
-    def connect(self, host, port):
-        self.host = host
-        self.port = port
-        log.debug("connecting to %s:%s...", host, port)
-        self.socket = self.create_socket(host, port)
+    def connect(self):
+        log.debug("connecting to %s:%s...", self.host, self.port)
+        self.socket = self.create_socket()
         self.file = self.socket.makefile()
-        self.call_count = 0
-        log.info("connected to %s:%s", host, port)
+        log.info("connected to %s:%s", self.host, self.port)
         self.version()
 
     def version(self):
@@ -52,7 +55,7 @@ class Connection(object):
     def close(self):
         self.socket.close()
         log.info("disconnected from %s:%s", self.host, self.port)
-        self.socket = self.host = self.port = self.file = self.version = None
+        self.socket = self.file = None
 
     def encode(self, payload):
         return json.dumps(payload).encode() + b"\n"
@@ -184,13 +187,19 @@ class ConnectionPool(object):
             addresses = peer.clearnet_addresses
             if not addresses:
                 continue
-            ports = peer.tcp_ports
+
+            ports = peer.ssl_ports
+            has_ssl = bool(ports)
+            if not has_ssl:
+                ports = peer.tcp_ports
+
             if not ports:
                 continue
+
             address = addresses[0]
             port = ports[0]
             try:
-                return Connection(host=address, port=port)
+                return Connection(host=address, port=port, ssl=has_ssl)
             except socket.error as e:
                 log.error("could not connect to %s: %s", address, e)
 
@@ -198,7 +207,7 @@ if __name__ == "__main__":
 
     pool = ConnectionPool()
 
-    for _ in range(5):
+    for _ in range(3):
         with pool.get() as conn:
             rv = conn.call("server.banner")
             print conn.host, conn.server_version
